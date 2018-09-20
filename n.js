@@ -4,7 +4,7 @@ function __wizrocket() {
     var targetDomain = 'wzrkt.com';
     targetDomain = 'localhost:2828'; //ALWAYS comment this line before deploying
 
-    var wz_pr = "https:";
+    var wz_pr = "http:";
 
     var dataPostURL, recorderURL, emailURL;
     var wiz = this;
