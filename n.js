@@ -2,9 +2,9 @@ function __wizrocket() {
 
 
     var targetDomain = 'wzrkt.com';
-    targetDomain = 'localhost:2828'; //ALWAYS comment this line before deploying
+    // var targetDomain = 'localhost:2828'; //ALWAYS comment this line before deploying
 
-    var wz_pr = "http:";
+    var wz_pr = "https:";
 
     var dataPostURL, recorderURL, emailURL;
     var wiz = this;
@@ -20,6 +20,9 @@ function __wizrocket() {
     // to be used for checking whether the script loaded fine and the wiz.init function was called
     var onloadcalled = 0;  // 1 = fired
     var processingBackup = false;
+    var unsubGroups = []
+    var updatedCategoryLong;
+    var categoryLongKey = "cUsY";
 
     var gcookie, scookieObj;
     var accountId, region;
@@ -30,6 +33,28 @@ function __wizrocket() {
     var storageDelim = "|$|";
     var staleEvtMaxTime = 20 * 60; //20 mins
     var COOKIE_EXPIRY = 86400 * 365 * 10; //10 years in seconds. Seconds in an days * days in an year * number of years
+    var LRU_CACHE, LRU_CACHE_SIZE = 100;
+    var chromeAgent;
+    var firefoxAgent;
+    var safariAgent;
+
+    // for VAPID web push
+    function urlBase64ToUint8Array(base64String) {
+        var padding = '='.repeat((4 - base64String.length % 4) % 4);
+        var base64 = (base64String + padding)
+            .replace(/\-/g, '+')
+            .replace(/_/g, '/')
+        ;
+        var rawData = window.atob(base64);
+        var processedData = []
+        for (var i=0; i<rawData.length; i++) {
+            processedData.push(rawData.charCodeAt(i))
+        }
+        return new Uint8Array(processedData);
+    }
+
+    var fcmPublicKey = null;
+
 
     var STRING_CONSTANTS = {
         CLEAR: 'clear',
@@ -53,7 +78,9 @@ function __wizrocket() {
         OPTOUT_KEY: 'optOut',
         CT_OPTOUT_KEY: 'ct_optout',
         OPTOUT_COOKIE_ENDSWITH: ':OO',
-        USEIP_KEY: 'useIP'
+        USEIP_KEY: 'useIP',
+        LRU_CACHE: 'WZRK_X',
+        IS_OUL: "isOUL"
     };
 
     // path to reference the JS for our dialog
@@ -66,6 +93,7 @@ function __wizrocket() {
 
     var SCOOKIE_EXP_TIME_IN_SECS = 60 * 20;  // 20 mins
 
+    var GROUP_SUBSCRIPTION_REQUEST_ID = "2";
 
     var EVT_PING = "ping", EVT_PUSH = "push";
 
@@ -106,8 +134,11 @@ function __wizrocket() {
     };
 
 
-    wiz.enableWebPush = function (enabled) {
+    wiz.enableWebPush = function (enabled, applicationServerKey) {
         webPushEnabled = enabled;
+        if(applicationServerKey != null) {
+            wiz.setApplicationServerKey(applicationServerKey);
+        }
         if (webPushEnabled && notifApi.notifEnabledFromApi) {
             wiz.handleNotificationRegistration(notifApi.displayArgs);
         } else if (!webPushEnabled && notifApi.notifEnabledFromApi) {
@@ -115,29 +146,90 @@ function __wizrocket() {
         }
     };
 
+    wiz.setUpWebPushNotifications = function (subscriptionCallback, serviceWorkerPath, apnsWebPushId, apnsServiceUrl) {
+        if(navigator.userAgent.indexOf('Chrome') !== -1 || navigator.userAgent.indexOf('Firefox') !== -1){
+            wiz.setUpChromeFirefoxNotifications(subscriptionCallback, serviceWorkerPath);
+        } else if(navigator.userAgent.indexOf('Safari') !== -1){
+            wiz.setUpSafariNotifications(subscriptionCallback, apnsWebPushId, apnsServiceUrl);
+        }
+    };
+
     /**
      * Sets up a service worker for chrome push notifications and sends the data to LC
      */
-    wiz.setUpChromeNotifications = function (subscriptionCallback, serviceWorkerPath) {
+    wiz.setUpSafariNotifications= function (subscriptionCallback, apnsWebPushId, apnsServiceUrl) {
+        // ensure that proper arguments are passed
+        if (typeof apnsWebPushId === "undefined") {
+            wc.e('Ensure that APNS Web Push ID is supplied');
+        }
+        if (typeof apnsServiceUrl === "undefined") {
+            wc.e('Ensure that APNS Web Push service path is supplied');
+        }
+        if ('safari' in window && 'pushNotification' in window['safari']) {
+            window['safari']['pushNotification']['requestPermission'](
+                apnsServiceUrl,
+                apnsWebPushId, {}, function (subscription) {
+                    if (subscription['permission'] === 'granted') {
+                        var subscriptionData = JSON.parse(JSON.stringify(subscription));
+                        subscriptionData['endpoint'] = subscription['deviceToken'];
+                        subscriptionData['browser'] = 'Safari';
+
+                        var payload = subscriptionData;
+                        payload = wiz.addSystemDataToObject(payload, true);
+                        payload = JSON.stringify(payload);
+                        var pageLoadUrl = dataPostURL;
+                        pageLoadUrl = wiz.addToURL(pageLoadUrl, "type", "data");
+                        pageLoadUrl = wiz.addToURL(pageLoadUrl, "d", wiz.compressData(payload));
+                        wiz.fireRequest(pageLoadUrl);
+                        //set in localstorage
+                        if (wzrk_util.isLocalStorageSupported()) {
+                            localStorage.setItem(STRING_CONSTANTS.WEBPUSH_LS_KEY, 'ok');
+                        }
+                        wc.l('Safari Web Push registered. Device Token: ' + subscription['deviceToken']);
+                    } else if (subscription.permission === 'denied') {
+                        wc.l('Error subscribing to Safari web push');
+                    }
+                });
+        }
+    }
+
+    /**
+     * Sets up a service worker for WebPush(chrome/Firefox) push notifications and sends the data to LC
+     */
+    wiz.setUpChromeFirefoxNotifications = function (subscriptionCallback, serviceWorkerPath) {
 
 
         if ('serviceWorker' in navigator) {
             navigator["serviceWorker"]['register'](serviceWorkerPath)['then'](function () {
                 return navigator['serviceWorker']['ready'];
             })['then'](function (serviceWorkerRegistration) {
-                serviceWorkerRegistration['pushManager']['subscribe']({'userVisibleOnly': true})
+
+                var subscribeObj = { "userVisibleOnly": true }
+
+                if(fcmPublicKey != null) {
+                    subscribeObj["applicationServerKey"] = urlBase64ToUint8Array(fcmPublicKey)
+                }
+
+                serviceWorkerRegistration['pushManager']['subscribe'](subscribeObj)
                     ['then'](function (subscription) {
                     wc.l('Service Worker registered. Endpoint: ' + subscription['endpoint']);
 
                     // convert the subscription keys to strings; this sets it up nicely for pushing to LC
                     var subscriptionData = JSON.parse(JSON.stringify(subscription));
 
-                    // remove the common chrome endpoint at the beginning of the token
-                    subscriptionData['endpoint'] = subscriptionData['endpoint'].split('/').pop();
+                    // remove the common chrome/firefox endpoint at the beginning of the token
+                    if(navigator.userAgent.indexOf('Chrome') !== -1){
+                        subscriptionData['endpoint'] = subscriptionData['endpoint'].split('/').pop();
+                        subscriptionData['browser'] = 'Chrome';
+                    }else if(navigator.userAgent.indexOf('Firefox') !== -1){
+                        subscriptionData['endpoint'] = subscriptionData['endpoint'].split('/').pop();
+                        subscriptionData['browser'] = 'Firefox';
+                    }
 
                     var sessionObj = wiz.getSessionCookieObject();
-                    var shouldSendToken = typeof sessionObj['p'] === STRING_CONSTANTS.UNDEFINED || sessionObj['p'] === 1
-                        || sessionObj['p'] === 2 || sessionObj['p'] === 3;
+                    // var shouldSendToken = typeof sessionObj['p'] === STRING_CONSTANTS.UNDEFINED || sessionObj['p'] === 1
+                    //     || sessionObj['p'] === 2 || sessionObj['p'] === 3 || sessionObj['p'] === 4 || sessionObj['p'] === 5;
+                    var shouldSendToken = true;
                     if (shouldSendToken) {
                         var payload = subscriptionData;
                         payload = wiz.addSystemDataToObject(payload, true);
@@ -209,8 +301,6 @@ function __wizrocket() {
         wiz.g(); // load cookies on pageload; this HAS to be the first thing in this method
 
 
-
-
         if (typeof wizrocket['account'][0] == STRING_CONSTANTS.UNDEFINED) {
             wc.e(wzrk_msg['embed-error']);
             return;
@@ -229,7 +319,7 @@ function __wizrocket() {
             targetDomain = region + '.' + targetDomain;
         }
 
-        dataPostURL = wz_pr + '//' + targetDomain + '/a?t=88';
+        dataPostURL = wz_pr + '//' + targetDomain + '/a?t=96';
         recorderURL = wz_pr + '//' + targetDomain + '/r?r=1';
         emailURL = wz_pr + '//' + targetDomain + '/e?r=1';
 
@@ -451,7 +541,7 @@ function __wizrocket() {
             if (wzrk_util.isLocalStorageSupported()) {
                 localStorage[property] = encodeURIComponent(JSON.stringify(val));
             } else {
-                if(property === STRING_CONSTANTS.GCOOKIE_NAME) {
+                if (property === STRING_CONSTANTS.GCOOKIE_NAME) {
                     wiz.createCookie(property, encodeURIComponent(val), 0, domain);
                 } else {
                     wiz.createCookie(property, encodeURIComponent(JSON.stringify(val)), 0, domain);
@@ -603,7 +693,12 @@ function __wizrocket() {
         }
     };
 
-    wiz.addARPToRequest = function (url) {
+    wiz.addARPToRequest = function (url, skipResARP) {
+        if(typeof skipResARP !== STRING_CONSTANTS.UNDEFINED && skipResARP === true) {
+            var _arp = {};
+            _arp["skipResARP"] = true;
+            return wiz.addToURL(url, 'arp', wiz.compressData(JSON.stringify(_arp)));
+        }
         if (wzrk_util.isLocalStorageSupported() && typeof localStorage[STRING_CONSTANTS.ARP_COOKIE] != STRING_CONSTANTS.UNDEFINED) {
             return wiz.addToURL(url, 'arp', wiz.compressData(JSON.stringify(wiz.readFromLSorCookie(STRING_CONSTANTS.ARP_COOKIE))));
         }
@@ -635,6 +730,145 @@ function __wizrocket() {
         }
 
 
+    };
+
+    var unregisterTokenForGuid = function (givenGUID) {
+        var data = {};
+        data["type"] = "data";
+        if (wiz.isValueValid(givenGUID)) {
+            data["g"] = givenGUID;
+        }
+        data["action"] = "unregister";
+        data["id"] = accountId;
+
+        var obj = wiz.getSessionCookieObject();
+
+        data["s"] = obj["s"]; //Session cookie
+        var compressedData = wiz.compressData(JSON.stringify(data));
+
+        var pageLoadUrl = dataPostURL;
+        pageLoadUrl = wiz.addToURL(pageLoadUrl, "type", "data");
+        pageLoadUrl = wiz.addToURL(pageLoadUrl, "d", compressedData);
+
+        wiz.fireRequest(pageLoadUrl, true);
+    };
+
+    var LRU_cache = function (max) {
+        this.max = max;
+        var keyOrder;
+        var LRU_CACHE = wiz.readFromLSorCookie(STRING_CONSTANTS.LRU_CACHE);
+        if (LRU_CACHE) {
+            var lru_cache = {};
+            keyOrder = [];
+            LRU_CACHE = LRU_CACHE.cache;
+            for (var entry in LRU_CACHE) {
+                if(LRU_CACHE.hasOwnProperty(entry)) {
+                    lru_cache[LRU_CACHE[entry][0]] = LRU_CACHE[entry][1];
+                    keyOrder.push(LRU_CACHE[entry][0]);
+                }
+
+            }
+            this.cache = lru_cache;
+        } else {
+            this.cache = {};
+            keyOrder = [];
+        }
+
+        this.get = function (key) {
+            var item = this.cache[key];
+            if (item) {
+                var temp_val = item;
+                this.cache = deleteFromObject(key, this.cache);
+                this.cache[key] = item;
+                keyOrder.push(key);
+            }
+            this.saveCacheToLS(this.cache);
+            return item;
+        };
+
+        this.set = function (key, value) {
+            var item = this.cache[key];
+            var all_keys = keyOrder;
+            if (item != null) {
+                this.cache = deleteFromObject(key, this.cache);
+            } else if (all_keys.length === this.max) {
+                this.cache = deleteFromObject(
+                    all_keys[0],
+                    this.cache
+                );
+            }
+            this.cache[key] = value;
+            if (keyOrder[keyOrder.length - 1] !== key) {
+                keyOrder.push(key);
+            }
+            this.saveCacheToLS(this.cache);
+        };
+
+        this.saveCacheToLS = function (cache) {
+            var obj_to_array = [];
+            var all_keys = keyOrder;
+            for (var index in all_keys) {
+                if(all_keys.hasOwnProperty(index)) {
+                    var temp = [];
+                    temp.push(all_keys[index]);
+                    temp.push(cache[all_keys[index]]);
+                    obj_to_array.push(temp);
+                }
+            }
+            wiz.saveToLSorCookie(STRING_CONSTANTS.LRU_CACHE, {
+                cache: obj_to_array
+            });
+        };
+
+        this.getKEY = function (givenVal) {
+            if (givenVal == null) return null;
+            var all_keys = keyOrder;
+            for (var index in all_keys) {
+                if(all_keys.hasOwnProperty(index)) {
+                    if (
+                        this.cache[all_keys[index]] != null &&
+                        this.cache[all_keys[index]] === givenVal
+                    ) {
+                        return all_keys[index];
+                    }
+                }
+            }
+            return null;
+        };
+
+        this.getSecondLastKEY = function () {
+            var keysArr = keyOrder;
+            if (keysArr != null && keysArr.length > 1) {
+                return keysArr[keysArr.length - 2];
+            } else {
+                return -1;
+            }
+        };
+
+        this.getLastKey = function () {
+            if (keyOrder.length) {
+                return keyOrder[keyOrder.length - 1];
+            }
+        };
+
+
+        var deleteFromObject = function (key, obj) {
+            var all_keys = JSON.parse(JSON.stringify(keyOrder));
+            var new_cache = {};
+            var indexToDelete;
+            for (var index in all_keys) {
+                if(all_keys.hasOwnProperty(index)) {
+                    if (all_keys[index] !== key) {
+                        new_cache[all_keys[index]] = obj[all_keys[index]];
+                    } else {
+                        indexToDelete = index;
+                    }
+                }
+            }
+            all_keys.splice(indexToDelete, 1);
+            keyOrder = JSON.parse(JSON.stringify(all_keys));
+            return new_cache;
+        };
     };
 
     wiz.getCampaignObjForLc = function () {
@@ -677,6 +911,22 @@ function __wizrocket() {
         }
     };
 
+    var handleCookieFromCache = function () {
+        blockRequeust = false;
+        wc.d("Block request is false");
+        if (wzrk_util.isLocalStorageSupported()) {
+            delete localStorage[STRING_CONSTANTS.PR_COOKIE];
+            delete localStorage[STRING_CONSTANTS.EV_COOKIE];
+            delete localStorage[STRING_CONSTANTS.META_COOKIE];
+            delete localStorage[STRING_CONSTANTS.ARP_COOKIE];
+            delete localStorage[STRING_CONSTANTS.CAMP_COOKIE_NAME];
+            delete localStorage[STRING_CONSTANTS.CHARGEDID_COOKIE_NAME];
+        }
+        wiz.deleteCookie(STRING_CONSTANTS.CAMP_COOKIE_NAME, domain);
+        wiz.deleteCookie(SCOOKIE_NAME, broadDomain);
+        wiz.deleteCookie(STRING_CONSTANTS.ARP_COOKIE, broadDomain);
+        scookieObj = '';
+    };
 
     var deleteUser = function () {
         blockRequeust = true;
@@ -716,17 +966,34 @@ function __wizrocket() {
         setInstantDeleteFlagInK();
     };
 
+
     wiz.clear = function () {
         wc.d("clear called. Reset flag has been set.");
         deleteUser();
         wiz.setMetaProp(STRING_CONSTANTS.CLEAR, true);
     };
 
+
+    /*
+          We dont set the arp in cache for deregister requests.
+          For deregister requests we check for 'skipResARP' flag payload. If present we skip it.
+
+          Whenever we get 'isOUL' flag true in payload we delete the existing ARP instead of updating it.
+       */
     wiz.arp = function (jsonMap) {
+        // For unregister calls dont set arp in LS
+        if(typeof jsonMap["skipResARP"] !== STRING_CONSTANTS.UNDEFINED && jsonMap["skipResARP"]) {
+            wc.d("Update ARP Request rejected", jsonMap);
+            return null;
+        }
+
+        var isOULARP = (typeof jsonMap[STRING_CONSTANTS.IS_OUL] !== STRING_CONSTANTS.UNDEFINED
+            && jsonMap[STRING_CONSTANTS.IS_OUL] === true) ? true : false;
+
         if (wzrk_util.isLocalStorageSupported()) {
             try {
                 var arpFromStorage = wiz.readFromLSorCookie(STRING_CONSTANTS.ARP_COOKIE);
-                if (typeof arpFromStorage == STRING_CONSTANTS.UNDEFINED) {
+                if (typeof arpFromStorage == STRING_CONSTANTS.UNDEFINED || isOULARP) {
                     arpFromStorage = {};
                 }
 
@@ -750,125 +1017,222 @@ function __wizrocket() {
     };
 
     wiz.processProfileArray = function (profileArr) {
+        if (wzrk_util.isArray(profileArr) && profileArr.length > 0) {
 
-        var addToK = function (ids) {
-            var k = wiz.readFromLSorCookie(STRING_CONSTANTS.KCOOKIE_NAME);
-            var lseenTs, idArr, flag;
-            var nowDate = new Date();
-            var now = nowDate.getTime();
-            if (typeof k == STRING_CONSTANTS.UNDEFINED) {
-                k = {};
-                lseenTs = now;
-                idArr = ids;
-            } else {/*check if already exists*/
-                lseenTs = k['ls'];
-                idArr = k['id'];
-                var sameUser = false;
-                if (typeof idArr == STRING_CONSTANTS.UNDEFINED) {
-                    idArr = [];
-                    sameUser = true;
-                }
-                if (idArr.length > 20) {
-                    return;
-                }
-                flag = k['flag'];
-
-                for (var id in ids) {
-                    if (ids.hasOwnProperty(id)) {
-                        var found = false;
-                        for (var elem in idArr) {
-                            if (idArr.hasOwnProperty(elem)) {
-                                if (idArr[elem] === ids[id]) {
-                                    found = true;
-                                    sameUser = true;
-                                    break;
-                                }
-                            }
+            for (var index in profileArr) {
+                if(profileArr.hasOwnProperty(index)) {
+                    var outerObj = profileArr[index];
+                    var data = {};
+                    var profileObj;
+                    if (typeof outerObj['Site'] != STRING_CONSTANTS.UNDEFINED) {       //organic data from the site
+                        profileObj = outerObj['Site'];
+                        if (wzrk_util.isObjectEmpty(profileObj) || !wiz.isProfileValid(profileObj)) {
+                            return;
                         }
-                        if (!found) {
-                            idArr.push(ids[id]);
+
+                    } else if (typeof outerObj['Facebook'] != STRING_CONSTANTS.UNDEFINED) {   //fb connect data
+                        var FbProfileObj = outerObj['Facebook'];
+                        //make sure that the object contains any data at all
+
+                        if (!wzrk_util.isObjectEmpty(FbProfileObj) && (!FbProfileObj['error'])) {
+                            profileObj = wiz.processFBUserObj(FbProfileObj);
+                        }
+
+                    } else if (typeof outerObj['Google Plus'] != STRING_CONSTANTS.UNDEFINED) {
+                        var GPlusProfileObj = outerObj['Google Plus'];
+                        if (!wzrk_util.isObjectEmpty(GPlusProfileObj) && (!GPlusProfileObj['error'])) {
+                            profileObj = wiz.processGPlusUserObj(GPlusProfileObj);
                         }
                     }
-                }
-                if (!sameUser) {
-                    if (flag || (now - lseenTs > (60 * 1000))) {
-                        /* flag has been set - user has been logged out - new user || 60 secs have passed since last prof_push so new user*/
-                        //wipe cookie etc
-                        wiz.clear();
-                        idArr = ids;
+                    if (typeof profileObj != STRING_CONSTANTS.UNDEFINED && (!wzrk_util.isObjectEmpty(profileObj))) {   // profile got set from above
+                        data['type'] = "profile";
+                        if (typeof profileObj['tz'] === STRING_CONSTANTS.UNDEFINED) {
+                            //try to auto capture user timezone if not present
+                            profileObj['tz'] = new Date().toString().match(/([A-Z]+[\+-][0-9]+)/)[1];
+                        }
+
+                        data['profile'] = profileObj;
+                        wiz.addToLocalProfileMap(profileObj, true);
+                        data = wiz.addSystemDataToObject(data, undefined);
+
+                        wiz.addFlags(data);
+                        var compressedData = wiz.compressData(JSON.stringify(data));
+
+                        var pageLoadUrl = dataPostURL;
+                        pageLoadUrl = wiz.addToURL(pageLoadUrl, "type", EVT_PUSH);
+                        pageLoadUrl = wiz.addToURL(pageLoadUrl, "d", compressedData);
+
+                        wiz.saveAndFireRequest(pageLoadUrl, blockRequeust);
+
                     }
                 }
             }
-            k['id'] = idArr;
-            k['ls'] = now;
-            k['flag'] = false;
+        }
+    };
+
+    /*
+          anonymousUser   => Only GUID present.
+          foundInCache    => Identity used in On User Login is present in LRU_CACHE. So use the guid associated with it.
+
+          Clear the cache in case on On User Login and Block all the request till we get resume requests flag in the response.
+          When user is found in Cache or the user is anonymous then dont block any requests. Just clear cache (handleCookieFromCache)
+
+
+          On every On User Login we deregister the token for older User.
+          If new user is found in Cache then we call deregister function now
+          Else we call it once we get guid for new user in 'wiz.s' function.
+       */
+    wiz.processOUL = function (profileArr) {
+        var sendOULFlag = true;
+        var addToK = function (ids) {
+            var k = wiz.readFromLSorCookie(STRING_CONSTANTS.KCOOKIE_NAME);
+            var g = wiz.readFromLSorCookie(STRING_CONSTANTS.GCOOKIE_NAME);
+            var kId, flag;
+            var nowDate = new Date();
+            if (typeof k == STRING_CONSTANTS.UNDEFINED) {
+                k = {};
+                kId = ids;
+            } else {/*check if already exists*/
+                kId = k['id'];
+                var anonymousUser = false;
+                var foundInCache = false;
+                if (kId == null) {
+                    kId = ids[0];
+                    anonymousUser = true;
+                }
+
+                if (LRU_CACHE == null && wzrk_util.isLocalStorageSupported()) {
+                    LRU_CACHE = new LRU_cache(LRU_CACHE_SIZE);
+                }
+
+                if (anonymousUser) {
+                    if (wiz.isValueValid(g)) {
+                        LRU_CACHE.set(kId, g);
+                        blockRequeust = false;
+                    }
+                } else {
+                    for (var idx in ids) {
+                        if(ids.hasOwnProperty(idx)) {
+                            var id = ids[idx];
+                            if (LRU_CACHE.cache[id]) {
+                                kId = id;
+                                foundInCache = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (foundInCache) {
+                    if (kId !== LRU_CACHE.getLastKey()) {
+                        // Same User
+                        handleCookieFromCache();
+                    } else {
+                        sendOULFlag = false;
+                    }
+                    var g_from_cache = LRU_CACHE.get(kId);
+                    LRU_CACHE.set(kId, g_from_cache);
+                    wiz.saveToLSorCookie(STRING_CONSTANTS.GCOOKIE_NAME, g_from_cache);
+                    gcookie = g_from_cache;
+
+                    var lastK = LRU_CACHE.getSecondLastKEY();
+                    if(lastK !== -1) {
+                        var lastGUID = LRU_CACHE.cache[lastK];
+                        unregisterTokenForGuid(lastGUID);
+                    }
+                } else {
+                    if (!anonymousUser) {
+                        wiz.clear();
+                    } else {
+                        if (wiz.isValueValid(g)) {
+                            gcookie = g;
+                            wiz.saveToLSorCookie(STRING_CONSTANTS.GCOOKIE_NAME, g);
+                            sendOULFlag = false;
+                        }
+                    }
+                    kId = ids[0];
+                }
+            }
+            k['id'] = kId;
             wiz.saveToLSorCookie(STRING_CONSTANTS.KCOOKIE_NAME, k);
         };
 
         if (wzrk_util.isArray(profileArr) && profileArr.length > 0) {
 
             for (var index in profileArr) {
-                var outerObj = profileArr[index];
-                var data = {};
-                var profileObj;
-                if (typeof outerObj['Site'] != STRING_CONSTANTS.UNDEFINED) {       //organic data from the site
-                    profileObj = outerObj['Site'];
-                    if (wzrk_util.isObjectEmpty(profileObj) || !wiz.isProfileValid(profileObj)) {
-                        return;
-                    }
-
-                } else if (typeof outerObj['Facebook'] != STRING_CONSTANTS.UNDEFINED) {   //fb connect data
-                    var FbProfileObj = outerObj['Facebook'];
-                    //make sure that the object contains any data at all
-
-                    if (!wzrk_util.isObjectEmpty(FbProfileObj) && (!FbProfileObj['error'])) {
-                        profileObj = wiz.processFBUserObj(FbProfileObj);
-                    }
-
-                } else if (typeof outerObj['Google Plus'] != STRING_CONSTANTS.UNDEFINED) {
-                    var GPlusProfileObj = outerObj['Google Plus'];
-                    if (!wzrk_util.isObjectEmpty(GPlusProfileObj) && (!GPlusProfileObj['error'])) {
-                        profileObj = wiz.processGPlusUserObj(GPlusProfileObj);
-                    }
-                }
-                if (typeof profileObj != STRING_CONSTANTS.UNDEFINED && (!wzrk_util.isObjectEmpty(profileObj))) {   // profile got set from above
-                    data['type'] = "profile";
-                    if (typeof profileObj['tz'] === STRING_CONSTANTS.UNDEFINED) {
-                        //try to auto capture user timezone if not present
-                        profileObj['tz'] = new Date().toString().match(/([A-Z]+[\+-][0-9]+)/)[1];
-                    }
-
-                    data['profile'] = profileObj;
-                    var ids = [];
-                    if (wzrk_util.isLocalStorageSupported()) {
-                        if (typeof profileObj['Email'] != STRING_CONSTANTS.UNDEFINED) {
-                            ids.push(profileObj['Email']);
+                if(profileArr.hasOwnProperty(index)) {
+                    var outerObj = profileArr[index];
+                    var data = {};
+                    var profileObj;
+                    if (typeof outerObj['Site'] != STRING_CONSTANTS.UNDEFINED) {       //organic data from the site
+                        profileObj = outerObj['Site'];
+                        if (wzrk_util.isObjectEmpty(profileObj) || !wiz.isProfileValid(profileObj)) {
+                            return;
                         }
-                        if (typeof profileObj['GPID'] != STRING_CONSTANTS.UNDEFINED) {
-                            ids.push("GP:" + profileObj['GPID']);
+
+                    } else if (typeof outerObj['Facebook'] != STRING_CONSTANTS.UNDEFINED) {   //fb connect data
+                        var FbProfileObj = outerObj['Facebook'];
+                        //make sure that the object contains any data at all
+
+                        if (!wzrk_util.isObjectEmpty(FbProfileObj) && (!FbProfileObj['error'])) {
+                            profileObj = wiz.processFBUserObj(FbProfileObj);
                         }
-                        if (typeof profileObj['FBID'] != STRING_CONSTANTS.UNDEFINED) {
-                            ids.push("FB:" + profileObj['FBID']);
-                        }
-                        if (typeof profileObj['Identity'] != STRING_CONSTANTS.UNDEFINED) {
-                            ids.push(profileObj['Identity']);
-                        }
-                        if (ids.length > 0) {
-                            addToK(ids);
+
+                    } else if (typeof outerObj['Google Plus'] != STRING_CONSTANTS.UNDEFINED) {
+                        var GPlusProfileObj = outerObj['Google Plus'];
+                        if (!wzrk_util.isObjectEmpty(GPlusProfileObj) && (!GPlusProfileObj['error'])) {
+                            profileObj = wiz.processGPlusUserObj(GPlusProfileObj);
                         }
                     }
-                    wiz.addToLocalProfileMap(profileObj, true);
-                    data = wiz.addSystemDataToObject(data, undefined);
+                    if (typeof profileObj != STRING_CONSTANTS.UNDEFINED && (!wzrk_util.isObjectEmpty(profileObj))) {   // profile got set from above
+                        data['type'] = "profile";
+                        if (typeof profileObj['tz'] === STRING_CONSTANTS.UNDEFINED) {
+                            //try to auto capture user timezone if not present
+                            profileObj['tz'] = new Date().toString().match(/([A-Z]+[\+-][0-9]+)/)[1];
+                        }
 
-                    wiz.addFlags(data);
-                    var compressedData = wiz.compressData(JSON.stringify(data));
+                        data['profile'] = profileObj;
+                        var ids = [];
+                        if (wzrk_util.isLocalStorageSupported()) {
+                            if (typeof profileObj['Identity'] != STRING_CONSTANTS.UNDEFINED) {
+                                ids.push(profileObj['Identity']);
+                            }
+                            if (typeof profileObj['Email'] != STRING_CONSTANTS.UNDEFINED) {
+                                ids.push(profileObj['Email']);
+                            }
+                            if (typeof profileObj['GPID'] != STRING_CONSTANTS.UNDEFINED) {
+                                ids.push("GP:" + profileObj['GPID']);
+                            }
+                            if (typeof profileObj['FBID'] != STRING_CONSTANTS.UNDEFINED) {
+                                ids.push("FB:" + profileObj['FBID']);
+                            }
+                            if (ids.length > 0) {
+                                addToK(ids);
+                            }
+                        }
+                        wiz.addToLocalProfileMap(profileObj, true);
+                        data = wiz.addSystemDataToObject(data, undefined);
 
-                    var pageLoadUrl = dataPostURL;
-                    pageLoadUrl = wiz.addToURL(pageLoadUrl, "type", EVT_PUSH);
-                    pageLoadUrl = wiz.addToURL(pageLoadUrl, "d", compressedData);
+                        wiz.addFlags(data);
+                        // Adding 'isOUL' flag in true for OUL cases which.
+                        // This flag tells LC to create a new arp object.
+                        // Also we will receive the same flag in response arp which tells to delete existing arp object.
+                        if(sendOULFlag) {
+                            data[STRING_CONSTANTS.IS_OUL] = true;
+                        }
 
-                    wiz.saveAndFireRequest(pageLoadUrl, blockRequeust);
+                        var compressedData = wiz.compressData(JSON.stringify(data));
 
+                        var pageLoadUrl = dataPostURL;
+                        pageLoadUrl = wiz.addToURL(pageLoadUrl, "type", EVT_PUSH);
+                        pageLoadUrl = wiz.addToURL(pageLoadUrl, "d", compressedData);
+
+                        // Whenever sendOULFlag is true then dont send arp and gcookie (guid in memory in the request)
+                        // Also when this flag is set we will get another flag from LC in arp which tells us to delete arp
+                        // stored in the cache and replace it with the response arp.
+                        wiz.saveAndFireRequest(pageLoadUrl, blockRequeust, sendOULFlag);
+
+                    }
                 }
             }
         }
@@ -879,11 +1243,11 @@ function __wizrocket() {
             var profileObj = loginArr.pop();
             var processProfile = typeof profileObj != STRING_CONSTANTS.UNDEFINED && wzrk_util.isObject(profileObj) &&
                 ((typeof profileObj['Site'] != STRING_CONSTANTS.UNDEFINED && Object.keys(profileObj["Site"]).length > 0) ||
-                    (typeof profileObj['Facebook'] != STRING_CONSTANTS.UNDEFINED && Object.keys(profileObj["Facebook"]).length > 0 ) ||
+                    (typeof profileObj['Facebook'] != STRING_CONSTANTS.UNDEFINED && Object.keys(profileObj["Facebook"]).length > 0) ||
                     (typeof profileObj['Google Plus'] != "undefined" && Object.keys(profileObj["Google Plus"]).length > 0));
             if (processProfile) {
                 setInstantDeleteFlagInK();
-                wiz.processProfileArray([profileObj]);
+                wiz.processOUL([profileObj]);
             } else {
                 //console.error
                 wc.e("Profile object is in incorrect format");
@@ -948,42 +1312,42 @@ function __wizrocket() {
 
     var isOptInRequest = false;
 
-    var dropRequestDueToOptOut = function() {
-        if(isOptInRequest || !wiz.isValueValid(gcookie) || !wzrk_util.isString(gcookie)){
+    var dropRequestDueToOptOut = function () {
+        if (isOptInRequest || !wiz.isValueValid(gcookie) || !wzrk_util.isString(gcookie)) {
             isOptInRequest = false;
             return false;
         }
         return gcookie.slice(-3) === STRING_CONSTANTS.OPTOUT_COOKIE_ENDSWITH;
     };
 
-    var addUseIPToRequest = function(pageLoadUrl) {
+    var addUseIPToRequest = function (pageLoadUrl) {
         var useIP = wiz.getMetaProp(STRING_CONSTANTS.USEIP_KEY);
-        if(typeof useIP !== 'boolean'){
+        if (typeof useIP !== 'boolean') {
             useIP = false;
         }
         return wiz.addToURL(pageLoadUrl, STRING_CONSTANTS.USEIP_KEY, useIP ? 'true' : 'false');
     };
 
-    wiz.processPrivacyArray = function(privacyArr){
+    wiz.processPrivacyArray = function (privacyArr) {
         if (wzrk_util.isArray(privacyArr) && privacyArr.length > 0) {
             var privacyObj = privacyArr[0];
             var data = {};
             var profileObj = {};
-            if(privacyObj.hasOwnProperty(STRING_CONSTANTS.OPTOUT_KEY)){
+            if (privacyObj.hasOwnProperty(STRING_CONSTANTS.OPTOUT_KEY)) {
                 var optOut = privacyObj[STRING_CONSTANTS.OPTOUT_KEY];
-                if(typeof optOut === 'boolean'){
+                if (typeof optOut === 'boolean') {
                     profileObj[STRING_CONSTANTS.CT_OPTOUT_KEY] = optOut;
                     //should be true when user wants to opt in
                     isOptInRequest = !optOut;
                 }
             }
-            if(privacyObj.hasOwnProperty(STRING_CONSTANTS.USEIP_KEY)){
+            if (privacyObj.hasOwnProperty(STRING_CONSTANTS.USEIP_KEY)) {
                 var useIP = privacyObj[STRING_CONSTANTS.USEIP_KEY];
-                if(typeof useIP === 'boolean'){
+                if (typeof useIP === 'boolean') {
                     wiz.setMetaProp(STRING_CONSTANTS.USEIP_KEY, useIP);
                 }
             }
-            if(!wzrk_util.isObjectEmpty(profileObj)){
+            if (!wzrk_util.isObjectEmpty(profileObj)) {
                 data['type'] = "profile";
                 data['profile'] = profileObj;
                 data = wiz.addSystemDataToObject(data, undefined);
@@ -997,7 +1361,7 @@ function __wizrocket() {
         }
     };
 
-    wiz.saveAndFireRequest = function (url, override) {
+    wiz.saveAndFireRequest = function (url, override, sendOULFlag) {
 
         var now = wzrk_util.getNow();
         url = wiz.addToURL(url, "rn", ++REQ_N);
@@ -1013,7 +1377,7 @@ function __wizrocket() {
                 seqNo = 0;
             }
 
-            wiz.fireRequest(data);
+            wiz.fireRequest(data, false, sendOULFlag);
 
         } else {
             wc.d("Not fired due to block request - " + blockRequeust + " or clearCookie - " + clearCookie);
@@ -1022,7 +1386,7 @@ function __wizrocket() {
     };
 
 
-// profile like https://developers.google.com/+/api/latest/people
+    // profile like https://developers.google.com/+/api/latest/people
     wiz.processGPlusUserObj = function (user) {
 
         var profileData = {};
@@ -1161,31 +1525,79 @@ function __wizrocket() {
     };
 
 
-    wiz.getEmail = function () {
-        wiz.handleEmailSubscription('-1');
+    wiz.getEmail = function (reEncoded, withGroups) {
+        wiz.handleEmailSubscription('-1', reEncoded, withGroups);
     };
 
-
-    wiz.unSubEmail = function () {
-        wiz.handleEmailSubscription("0")
+    wiz.unSubEmail = function (reEncoded) {
+        wiz.handleEmailSubscription("0", reEncoded)
     };
 
-    wiz.subEmail = function () {
-        wiz.handleEmailSubscription("1")
+    wiz.unsubEmailGroups = function (reEncoded) {
+        unsubGroups = []
+        var elements = document.getElementsByClassName(
+            "ct-unsub-group-input-item");
+
+        for (var i = 0; i < elements.length; i++) {
+            var element = elements[i];
+            if(element.name) {
+                var data = {name: element.name, isUnsubscribed: element.checked}
+                unsubGroups.push(data)
+            }
+        }
+
+        wiz.handleEmailSubscription(GROUP_SUBSCRIPTION_REQUEST_ID, reEncoded);
     };
 
-    wiz.handleEmailSubscription = function (subscription) {
+    wiz.changeSubscriptionGroups = function (reEncoded, updatedGroups) {
+        wiz.setSubscriptionGroups(updatedGroups);
+        wiz.handleEmailSubscription(GROUP_SUBSCRIPTION_REQUEST_ID, reEncoded);
+    };
+
+    wiz.setUpdatedCategoryLong = function (profile) {
+        if(profile[categoryLongKey]) {
+            updatedCategoryLong = profile[categoryLongKey];
+        }
+    };
+
+    wiz.setSubscriptionGroups = function(value) {
+        unsubGroups = value;
+    };
+
+    wiz.getSubscriptionGroups = function () {
+        return unsubGroups;
+    };
+
+    wiz.subEmail = function (reEncoded) {
+        wiz.handleEmailSubscription("1", reEncoded);
+    };
+
+    wiz.handleEmailSubscription = function (subscription, reEncoded, fetchGroups) {
 
         var url_params_as_is = wzrk_util.getURLParams(location.href);  // can't use url_params as it is in lowercase above
         var encodedEmailId = url_params_as_is['e'];
+        var encodedProfileProps = url_params_as_is['p'];
 
         if (typeof encodedEmailId !== STRING_CONSTANTS.UNDEFINED) {
             var data = {};
             data['id'] = accountId;  //accountId
+            data['unsubGroups'] = unsubGroups; // unsubscribe groups
+            if(updatedCategoryLong) {
+                data[categoryLongKey] = updatedCategoryLong;
+            }
 
             var url = emailURL;
+            if(fetchGroups) {
+                url = wiz.addToURL(url, "fetchGroups", fetchGroups);
+            }
+            if(reEncoded) {
+                url = wiz.addToURL(url, "encoded", reEncoded);
+            }
             url = wiz.addToURL(url, "e", encodedEmailId);
             url = wiz.addToURL(url, "d", wiz.compressData(JSON.stringify(data)));
+            if(encodedProfileProps){
+                url =  wiz.addToURL(url, "p", encodedProfileProps);
+            }
 
             if (subscription != '-1') {
                 url = wiz.addToURL(url, "sub", subscription);
@@ -1309,7 +1721,7 @@ function __wizrocket() {
                     if (value.length == 32) {
                         guid = value;
                         wiz.saveToLSorCookie(STRING_CONSTANTS.GCOOKIE_NAME, value);
-                    }else{
+                    } else {
                         wc.e("Illegal guid " + value);
                     }
                 }
@@ -1322,11 +1734,11 @@ function __wizrocket() {
         }
         if (!wiz.isValueValid(guid)) {
             guid = wiz.readCookie(STRING_CONSTANTS.GCOOKIE_NAME);
-            if(wiz.isValueValid(guid) && (guid.indexOf('%') === 0 ||
-                guid.indexOf('\'') === 0 || guid.indexOf('"') === 0)){
+            if (wiz.isValueValid(guid) && (guid.indexOf('%') === 0 ||
+                guid.indexOf('\'') === 0 || guid.indexOf('"') === 0)) {
                 guid = null;
             }
-            if (wiz.isValueValid(guid)){
+            if (wiz.isValueValid(guid)) {
                 wiz.saveToLSorCookie(STRING_CONSTANTS.GCOOKIE_NAME, guid);
             }
         }
@@ -1418,13 +1830,42 @@ function __wizrocket() {
         }
 
         if (!wiz.isValueValid(gcookie) || resume || typeof optOutResponse === 'boolean') {
-            if(!wiz.isValueValid(gcookie)){
+            if (!wiz.isValueValid(gcookie)) {
                 //clear useIP meta prop
                 wiz.getAndClearMetaProp(STRING_CONSTANTS.USEIP_KEY);
             }
             wc.d("Cookie was " + gcookie + " set to " + global);
             gcookie = global;
             // global cookie
+
+            if (global) {
+                if (wzrk_util.isLocalStorageSupported()) {
+                    if (LRU_CACHE == null) {
+                        LRU_CACHE = new LRU_cache(LRU_CACHE_SIZE);
+                    }
+
+                    var kId_from_LS = wiz.readFromLSorCookie(
+                        STRING_CONSTANTS.KCOOKIE_NAME
+                    );
+                    if (kId_from_LS != null && kId_from_LS["id"] && resume) {
+                        var guidFromLRUCache = LRU_CACHE.cache[kId_from_LS["id"]];
+                        if (!guidFromLRUCache) {
+                            LRU_CACHE.set(kId_from_LS["id"], global);
+                        }
+                    }
+                    wiz.saveToLSorCookie(
+                        STRING_CONSTANTS.GCOOKIE_NAME,
+                        global
+                    );
+
+                    var lastK = LRU_CACHE.getSecondLastKEY();
+                    if(lastK !== -1) {
+                        var lastGUID = LRU_CACHE.cache[lastK];
+                        unregisterTokenForGuid(lastGUID);
+                    }
+                }
+            }
+
             wiz.createBroadCookie(STRING_CONSTANTS.GCOOKIE_NAME, global, COOKIE_EXPIRY, domain);
             wiz.saveToLSorCookie(STRING_CONSTANTS.GCOOKIE_NAME, global);
         }
@@ -1599,33 +2040,40 @@ function __wizrocket() {
 
     var MAX_TRIES = 50;
 
-    var fireRequest = function (url, tries) {
-        if(dropRequestDueToOptOut()){
+    var fireRequest = function (url, tries, skipARP, sendOULFlag) {
+        if (dropRequestDueToOptOut()) {
             wc.d("req dropped due to optout cookie: " + gcookie);
             return;
         }
-        if (!wiz.isValueValid(gcookie) && (RESP_N < REQ_N - 1) && tries < MAX_TRIES) {
+        if (
+            !wiz.isValueValid(gcookie) &&
+            RESP_N < REQ_N - 1 &&
+            tries < MAX_TRIES
+        ) {
             setTimeout(function () {
-                fireRequest(url, tries + 1);
+                fireRequest(url, tries + 1, skipARP, sendOULFlag);
             }, 50);
             return;
         }
 
-        if (wiz.isValueValid(gcookie)) {
-            //add cookie to url
-            url = wiz.addToURL(url, "gc", gcookie);
+        if(!sendOULFlag) {
+            if (wiz.isValueValid(gcookie)) {
+                //add cookie to url
+                url = wiz.addToURL(url, "gc", gcookie);
+            }
+            url = wiz.addARPToRequest(url, skipARP);
         }
-        url = wiz.addARPToRequest(url);
         // url = addUseIPToRequest(url);
         url = wiz.addToURL(url, "r", new Date().getTime()); // add epoch to beat caching of the URL
-        if (wizrocket.hasOwnProperty("plugin")) { //used to add plugin name in request parameter
+        if (wizrocket.hasOwnProperty("plugin")) {
+            //used to add plugin name in request parameter
             var plugin = wizrocket["plugin"];
             url = wiz.addToURL(url, "ct_pl", plugin);
         }
         if (url.indexOf("chrome-extension:") != -1) {
-            url = url.replace('chrome-extension:', 'https:');
+            url = url.replace("chrome-extension:", "https:");
         }
-        var s = doc.createElement('script');
+        var s = doc.createElement("script");
         s.setAttribute("type", "text/javascript");
         s.setAttribute("src", url);
         s.setAttribute("rel", "nofollow");
@@ -1635,8 +2083,8 @@ function __wizrocket() {
         wc.d("req snt -> url: " + url);
     };
 
-    wiz.fireRequest = function (url) {
-        fireRequest(url, 1);
+    wiz.fireRequest = function (url, skipARP, sendOULFlag) {
+        fireRequest(url, 1, skipARP, sendOULFlag);
     };
 
     wiz.closeIframe = function (campaignId, divIdIgnored) {
@@ -1688,6 +2136,9 @@ function __wizrocket() {
 
     };
 
+    wiz.setApplicationServerKey = function(applicationServerKey) {
+        fcmPublicKey = applicationServerKey;
+    }
 
     wiz.handleNotificationRegistration = function (displayArgs) {
 
@@ -1706,6 +2157,8 @@ function __wizrocket() {
         var serviceWorkerPath;
         var httpsPopupPath;
         var httpsIframePath;
+        var apnsWebPushId;
+        var apnsWebPushServiceUrl;
 
         if (displayArgs.length === 1) {
             if (wzrk_util.isObject(displayArgs[0])) {
@@ -1724,6 +2177,8 @@ function __wizrocket() {
                 serviceWorkerPath = notifObj["serviceWorkerPath"];
                 httpsPopupPath = notifObj["httpsPopupPath"];
                 httpsIframePath = notifObj["httpsIframePath"];
+                apnsWebPushId = notifObj["apnsWebPushId"];
+                apnsWebPushServiceUrl = notifObj["apnsWebPushServiceUrl"];
             }
         } else {
             titleText = displayArgs[0];
@@ -1763,10 +2218,18 @@ function __wizrocket() {
             return;
         }
 
-        // right now, we only support chrome v50 or higher
+        // right now, we only support Chrome V50 & higher & Firefox
         if (navigator.userAgent.indexOf('Chrome') !== -1) {
-            var chromeAgent = navigator.userAgent.match(/Chrome\/(\d+)/);
+            chromeAgent = navigator.userAgent.match(/Chrome\/(\d+)/);
             if (typeof chromeAgent === STRING_CONSTANTS.UNDEFINED || parseInt(chromeAgent[1], 10) < 50)
+                return;
+        }else if(navigator.userAgent.indexOf('Firefox') !== -1){
+            firefoxAgent = navigator.userAgent.match(/Firefox\/(\d+)/);
+            if(typeof firefoxAgent === STRING_CONSTANTS.UNDEFINED || parseInt(firefoxAgent[1], 10) < 50)
+                return;
+        }else if(navigator.userAgent.indexOf('Safari') !== -1){
+            safariAgent = navigator.userAgent.match(/Safari\/(\d+)/);
+            if(typeof safariAgent === STRING_CONSTANTS.UNDEFINED || parseInt(safariAgent[1], 10) < 50)
                 return;
         } else {
             return;
@@ -1775,13 +2238,13 @@ function __wizrocket() {
         // we check for the cookie in setUpChromeNotifications(); the tokens may have changed
 
         if (!isHTTP) {
-            if(typeof Notification === STRING_CONSTANTS.UNDEFINED){
+            if (typeof Notification === STRING_CONSTANTS.UNDEFINED) {
                 return;
             }
             // handle migrations from other services -> chrome notifications may have already been asked for before
             if (Notification.permission === 'granted') {
                 // skip the dialog and register
-                wiz.setUpChromeNotifications(subscriptionCallback, serviceWorkerPath);
+                wiz.setUpWebPushNotifications(subscriptionCallback, serviceWorkerPath, apnsWebPushId, apnsWebPushServiceUrl);
                 return;
             } else if (Notification.permission === 'denied') {
                 // we've lost this profile :'(
@@ -1789,7 +2252,7 @@ function __wizrocket() {
             }
 
             if (skipDialog) {
-                wiz.setUpChromeNotifications(subscriptionCallback, serviceWorkerPath);
+                wiz.setUpWebPushNotifications(subscriptionCallback, serviceWorkerPath, apnsWebPushId, apnsWebPushServiceUrl);
                 return;
             }
         }
@@ -1807,7 +2270,7 @@ function __wizrocket() {
 
         // make sure the user isn't asked for notifications more than askAgainTimeInSeconds
         var now = new Date().getTime() / 1000;
-        if (typeof(wiz.getMetaProp('notif_last_time')) === STRING_CONSTANTS.UNDEFINED) {
+        if (typeof (wiz.getMetaProp('notif_last_time')) === STRING_CONSTANTS.UNDEFINED) {
             wiz.setMetaProp('notif_last_time', now);
         } else {
             if (typeof askAgainTimeInSeconds === "undefined") {
@@ -1885,7 +2348,7 @@ function __wizrocket() {
                         if (typeof okCallback !== "undefined" && typeof okCallback === "function") {
                             okCallback();
                         }
-                        wiz.setUpChromeNotifications(subscriptionCallback, serviceWorkerPath);
+                        wiz.setUpWebPushNotifications(subscriptionCallback, serviceWorkerPath, apnsWebPushId, apnsWebPushServiceUrl);
                     } else {
                         if (typeof rejectCallback !== "undefined" && typeof rejectCallback === "function") {
                             rejectCallback();
@@ -1912,7 +2375,8 @@ function __wizrocket() {
                 if (typeof targetingMsgJson[STRING_CONSTANTS.DISPLAY]['wmc'] == STRING_CONSTANTS.UNDEFINED) {
                     targetingMsgJson[STRING_CONSTANTS.DISPLAY]['wmc'] = 1;
                 }
-                var excludeFromFreqCaps = -1, campaignSessionLimit = -1, campaignDailyLimit = -1, campaignTotalLimit = -1,
+                var excludeFromFreqCaps = -1, campaignSessionLimit = -1, campaignDailyLimit = -1,
+                    campaignTotalLimit = -1,
                     totalDailyLimit = -1, totalSessionLimit = -1;
                 if (typeof targetingMsgJson[STRING_CONSTANTS.DISPLAY]['efc'] != STRING_CONSTANTS.UNDEFINED) {
                     excludeFromFreqCaps = parseInt(targetingMsgJson[STRING_CONSTANTS.DISPLAY]['efc'], 10);
@@ -2139,7 +2603,7 @@ function __wizrocket() {
                 var width = viewWidth * 30 / 100 + 20;
                 var widthPerct = 'width:30%;';
                 //for small devices  - mobile phones
-                if ((/mobile/i.test(navigator.userAgent) || (/mini/i.test(navigator.userAgent)) ) && /iPad/i.test(navigator.userAgent) == false) {
+                if ((/mobile/i.test(navigator.userAgent) || (/mini/i.test(navigator.userAgent))) && /iPad/i.test(navigator.userAgent) == false) {
                     width = viewWidth * 85 / 100 + 20;
                     right = viewWidth * 5 / 100;
                     bottomPosition = viewHeight * 5 / 100;
@@ -2255,7 +2719,7 @@ function __wizrocket() {
             var ua = navigator.userAgent.toLowerCase();
             if (ua.indexOf('safari') !== -1) {
                 if (ua.indexOf('chrome') > -1) {
-                    iframe.onload = function(){
+                    iframe.onload = function () {
                         adjustIFrameHeight();
                         var contentDiv = document.getElementById("wiz-iframe").contentDocument.getElementById('contentDiv');
                         setupClickUrl(onClick, targetingMsgJson, contentDiv, divId, legacy);
@@ -2263,7 +2727,9 @@ function __wizrocket() {
                 } else {
                     var inDoc = iframe.contentDocument || iframe.contentWindow;
                     if (inDoc.document) inDoc = inDoc.document;
-                    var _timer = setInterval(function() {
+                    // safari iphone 7+ needs this.
+                    adjustIFrameHeight();
+                    var _timer = setInterval(function () {
                         if (inDoc.readyState === 'complete') {
                             clearInterval(_timer);
                             //adjust iframe and body height of html inside correctly
@@ -2274,7 +2740,7 @@ function __wizrocket() {
                     }, 10);
                 }
             } else {
-                iframe.onload = function(){
+                iframe.onload = function () {
                     //adjust iframe and body height of html inside correctly
                     adjustIFrameHeight();
                     var contentDiv = document.getElementById("wiz-iframe").contentDocument.getElementById('contentDiv');
@@ -2767,13 +3233,18 @@ function __wizrocket() {
     wiz['closeIframe'] = wiz.closeIframe;
     wiz['getEmail'] = wiz.getEmail;
     wiz['unSubEmail'] = wiz.unSubEmail;
+    wiz['unsubEmailGroups'] = wiz.unsubEmailGroups;
+    wiz['changeSubscriptionGroups'] = wiz.changeSubscriptionGroups;
+    wiz['getSubscriptionGroups'] = wiz.getSubscriptionGroups;
+    wiz['setSubscriptionGroups'] = wiz.setSubscriptionGroups;
+    wiz['setUpdatedCategoryLong'] = wiz.setUpdatedCategoryLong;
     wiz['subEmail'] = wiz.subEmail;
     wiz['logout'] = wiz.logout;
     wiz['clear'] = wiz.clear;
     wizrocket['getCleverTapID'] = wiz.getCleverTapID;
 
 
-// ---------- compression part ----------
+    // ---------- compression part ----------
 
     var LZS = {
 
@@ -3107,8 +3578,7 @@ function __wizrocket() {
                 if (context_data_position == 15) {
                     context_data_string += f(context_data_val);
                     break;
-                }
-                else context_data_position++;
+                } else context_data_position++;
             }
             return context_data_string;
         }
@@ -3127,11 +3597,11 @@ function __wizrocket() {
         },
 
         isDateObject: function (input) {
-            return typeof(input) === "object" && (input instanceof Date);
+            return typeof (input) === "object" && (input instanceof Date);
         },
 
         convertToWZRKDate: function (dateObj) {
-            return ("$D_" + Math.round(dateObj.getTime() / 1000) );
+            return ("$D_" + Math.round(dateObj.getTime() / 1000));
         },
 
         isDateValid: function (date) {
@@ -3147,7 +3617,7 @@ function __wizrocket() {
         },
 
         isArray: function (input) {
-            return typeof(input) === "object" && (input instanceof Array);
+            return typeof (input) === "object" && (input instanceof Array);
         },
 
         isObject: function (input) {
@@ -3315,13 +3785,13 @@ function __wizrocket() {
 
     };
 
-// leading spaces, dot, colon, dollar, single quote, double quote, backslash, trailing spaces
+    // leading spaces, dot, colon, dollar, single quote, double quote, backslash, trailing spaces
     var unsupportedKeyCharRegex = new RegExp("^\\s+|\\\.|\:|\\\$|\'|\"|\\\\|\\s+$", "g");
 
-// leading spaces, single quote, double quote, backslash, trailing spaces
+    // leading spaces, single quote, double quote, backslash, trailing spaces
     var unsupportedValueCharRegex = new RegExp("^\\s+|\'|\"|\\\\|\\s+$", "g");
 
-//used to handle cookies in Opera mini
+    //used to handle cookies in Opera mini
     var doubleQuoteRegex = new RegExp("\"", "g");
     var singleQuoteRegex = new RegExp("\'", "g");
 
